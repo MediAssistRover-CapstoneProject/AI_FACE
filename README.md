@@ -30,7 +30,7 @@ Hai POST yêu cầu header `X-Face-Service-Key`.
 | `/v1/face/verify` | `image`, `template` 128 số, `modelVersion` | `matched`, `reason`, `score`, `modelVersion` |
 | `/health/ready` | Không | `ready`, `modelVersion`, `liveness:false` |
 
-Ảnh tối đa 2 MiB và 4 triệu pixel. Ảnh không mặt/nhiều mặt/mặt nhỏ hoặc mờ bị từ chối. Model thay đổi buộc tạo lại mẫu và admin duyệt lại. HTTP lỗi, model thiếu hoặc checksum sai không tạo kết quả khớp.
+Ảnh tối đa 2 MiB và 12 triệu pixel. Ảnh không mặt/nhiều mặt/mặt nhỏ hoặc mờ bị từ chối. Model thay đổi buộc tạo lại mẫu và admin duyệt lại. HTTP lỗi, model thiếu hoặc checksum sai không tạo kết quả khớp.
 
 ## Kiểm thử
 
@@ -46,3 +46,16 @@ Hướng dẫn tích hợp và nghiệm thu: [FACE_DELIVERY.md trong BE_MAR](htt
 ## Giới hạn bản demo
 
 Chưa có liveness/chống ảnh in hoặc video. Chỉ chạy có giám sát. Không coi việc khớp nhiều frame hoặc ảnh avatar được duyệt là chống giả mạo. Chưa nghiệm thu robot thật hoặc triển khai migration lên database đang vận hành.
+
+
+## Test hai ảnh trên Windows
+
+Restart service sau khi cập nhật code. Trong PowerShell thứ hai, đặt `FACE_SERVICE_KEY` trùng service rồi chạy:
+
+```powershell
+.\test_images.ps1 -AvatarPath "$env:USERPROFILE\Desktop\avatar.jpg" -CameraPath "$env:USERPROFILE\Desktop\camera.jpg"
+```
+
+Script tạo mẫu mới rồi so ảnh camera, không in template. `accepted` là kết quả tạo mẫu; `matched` là kết quả so sánh. Response bổ sung `quality`: kích thước xử lý, kích thước mặt và điểm nét; khi `reason=LOW_QUALITY`, xem `quality.issue` (`FACE_TOO_SMALL`, `FACE_TOO_BLURRY`, `INVALID_FACE_FEATURE`). Không ghi các ảnh cá nhân vào repository.
+
+Pipeline v2 xử lý hướng EXIF, giới hạn ảnh đầu vào 12 triệu pixel/2 MiB, chỉ thu nhỏ về cạnh dài tối đa 960 pixel. Độ nét được đo sau khi thu nhỏ vùng mặt về cạnh dài tối đa 160 pixel; không phóng lớn mặt nhỏ hoặc làm sắc nét để vượt kiểm tra. Ngưỡng cosine vẫn là 0.363. Pipeline mới đổi `modelVersion`: mẫu cũ phải tạo lại và duyệt lại khi dùng với BE. Ngưỡng chất lượng là heuristic cho demo, chưa hiệu chuẩn bằng dữ liệu camera staff thực tế.

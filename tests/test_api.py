@@ -82,6 +82,49 @@ def test_empty_template_rejected(client):
     assert response.status_code == 422
 
 
+def test_phone_size_image_is_bounded_before_detection(client):
+    response = client.post('/v1/face/enroll', headers=HEADERS,
+        json={'image': encoded(np.zeros((2560, 1920, 3), np.uint8))})
+    assert response.status_code == 200
+    assert response.json()['reason'] == 'NO_FACE'
+    assert response.json()['quality']['processingHeight'] == 960
+    assert response.json()['quality']['processingWidth'] == 720
+
+
+def test_excessive_dimensions_still_rejected(client):
+    buffer = io.BytesIO()
+    Image.new('RGB', (4000, 3001)).save(buffer, format='PNG')
+    response = client.post('/v1/face/enroll', headers=HEADERS,
+        json={'image': base64.b64encode(buffer.getvalue()).decode()})
+    assert response.status_code == 422
+    assert response.json()['detail'] == 'IMAGE_DIMENSIONS_TOO_LARGE'
+
+
+def test_small_face_is_not_enlarged_to_pass():
+    from unittest.mock import Mock
+    model = app.get_engine()
+    detector = Mock()
+    detector.detect.return_value = (None, np.array([[10, 10, 30, 40] + [0]*11], dtype=np.float32))
+    from unittest.mock import patch
+    with patch.object(model, 'detector', detector):
+        feature, reason, quality = model.analyze(np.zeros((100, 100, 3), np.uint8))
+    assert feature is None and reason == 'LOW_QUALITY'
+    assert quality['issue'] == 'FACE_TOO_SMALL'
+    assert quality['processingWidth'] == 100
+
+
+def test_blur_returns_specific_diagnostic():
+    from unittest.mock import Mock, patch
+    model = app.get_engine()
+    detector = Mock()
+    detector.detect.return_value = (None, np.array([[10, 10, 150, 150] + [0]*11], dtype=np.float32))
+    with patch.object(model, 'detector', detector):
+        feature, reason, quality = model.analyze(np.zeros((200, 200, 3), np.uint8))
+    assert feature is None and reason == 'LOW_QUALITY'
+    assert quality['issue'] == 'FACE_TOO_BLURRY'
+    assert quality['sharpness'] == 0
+
+
 def test_real_portrait_pair_and_two_faces(client):
     """Public NASA portraits, downloaded separately; never use staff data in Git."""
     root = Path(__file__).parent / 'fixtures'

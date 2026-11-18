@@ -10,12 +10,16 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 ROOT = Path(__file__).parent
 MAX_IMAGE = 2 * 1024 * 1024
+MAX_PIXELS = 12_000_000
+PROCESSING_EDGE = 960
+QUALITY_EDGE = 160
+PIPELINE_VERSION = 'bounded-exif-960-quality160-v2'
 LOCK = threading.Lock()
 app = FastAPI(title="MAR Face verification", docs_url=None, redoc_url=None)
 engine = None
@@ -56,12 +60,14 @@ def decode(value):
         if len(raw) > MAX_IMAGE:
             raise ValueError()
         with Image.open(io.BytesIO(raw)) as probe:
-            if probe.format not in ("JPEG", "PNG", "WEBP") or probe.width * probe.height > 4000000:
+            if probe.format not in ("JPEG", "PNG", "WEBP"):
                 raise ValueError()
-        image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError()
-        return image
+            if probe.width * probe.height > MAX_PIXELS:
+                raise HTTPException(422, "IMAGE_DIMENSIONS_TOO_LARGE")
+            oriented = ImageOps.exif_transpose(probe).convert('RGB')
+            return cv2.cvtColor(np.asarray(oriented), cv2.COLOR_RGB2BGR)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(422, "INVALID_IMAGE") from None
 
@@ -75,7 +81,7 @@ class Engine:
             if hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
                 raise ValueError("MODEL_CHECKSUM_MISMATCH")
             paths[name] = str(path)
-        self.version = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        self.version = hashlib.sha256((json.dumps(manifest, sort_keys=True) + PIPELINE_VERSION).encode()).hexdigest()
         self.detector = cv2.FaceDetectorYN.create(paths['yunet'], '', (320, 320), 0.9)
         self.recognizer = cv2.FaceRecognizerSF.create(paths['sface'], '')
         self.threshold = float(os.getenv('FACE_COSINE_THRESHOLD', '0.363'))
@@ -83,25 +89,48 @@ class Engine:
             raise ValueError('INVALID_THRESHOLD')
 
     def feature(self, image):
+        feature, reason, _ = self.analyze(image)
+        return feature, reason
+
+    def analyze(self, image):
+        # Downsample only; never enlarge a small face to pass the size gate.
+        h, w = image.shape[:2]
+        scale = min(1., PROCESSING_EDGE / max(h, w))
+        if scale < 1:
+            image = cv2.resize(image, (max(1, round(w*scale)), max(1, round(h*scale))), interpolation=cv2.INTER_AREA)
+        quality = {'processingWidth': image.shape[1], 'processingHeight': image.shape[0],
+                   'minFacePixels': 80, 'sharpnessThreshold': 40, 'qualityEdge': QUALITY_EDGE}
         with LOCK:
             h, w = image.shape[:2]
             self.detector.setInputSize((w, h))
             _, faces = self.detector.detect(image)
             if faces is None or len(faces) == 0:
-                return None, 'NO_FACE'
+                return None, 'NO_FACE', quality
             if len(faces) != 1:
-                return None, 'MULTIPLE_FACES'
+                return None, 'MULTIPLE_FACES', quality
             face = faces[0]
             x, y, width, height = face[:4].astype(int)
             crop = image[max(0,y):min(h,y+height), max(0,x):min(w,x+width)]
-            if min(width, height) < 80 or crop.size == 0 or cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < 40:
-                return None, 'LOW_QUALITY'
+            quality.update(faceWidth=int(width), faceHeight=int(height))
+            if crop.size == 0 or min(crop.shape[:2]) < 80:
+                quality['issue'] = 'FACE_TOO_SMALL'
+                return None, 'LOW_QUALITY', quality
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            quality_scale = min(1., QUALITY_EDGE / max(gray.shape))
+            if quality_scale < 1:
+                gray = cv2.resize(gray, (max(1, round(gray.shape[1]*quality_scale)), max(1, round(gray.shape[0]*quality_scale))), interpolation=cv2.INTER_AREA)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            quality['sharpness'] = round(sharpness, 2)
+            if sharpness < 40:
+                quality['issue'] = 'FACE_TOO_BLURRY'
+                return None, 'LOW_QUALITY', quality
             aligned = self.recognizer.alignCrop(image, face)
             feature = self.recognizer.feature(aligned).flatten()
             norm = np.linalg.norm(feature)
             if not np.isfinite(feature).all() or norm <= 0:
-                return None, 'LOW_QUALITY'
-            return feature / norm, 'OK'
+                quality['issue'] = 'INVALID_FACE_FEATURE'
+                return None, 'LOW_QUALITY', quality
+            return feature / norm, 'OK', quality
 
 
 def get_engine():
@@ -125,9 +154,9 @@ def ready():
 @app.post('/v1/face/enroll', dependencies=[Depends(authorized)])
 def enroll(body: Enroll):
     model = get_engine()
-    feature, reason = model.feature(decode(body.image))
+    feature, reason, quality = model.analyze(decode(body.image))
     return {'accepted': feature is not None, 'reason': reason, 'modelVersion': model.version,
-            'template': feature.tolist() if feature is not None else None}
+            'template': feature.tolist() if feature is not None else None, 'quality': quality}
 
 
 @app.post('/v1/face/verify', dependencies=[Depends(authorized)])
@@ -139,8 +168,8 @@ def verify(body: Verify):
     norm = np.linalg.norm(reference)
     if not np.isfinite(reference).all() or not np.isfinite(norm) or norm <= 0:
         raise HTTPException(422, 'INVALID_TEMPLATE')
-    feature, reason = model.feature(decode(body.image))
+    feature, reason, quality = model.analyze(decode(body.image))
     score = float(np.dot(feature, reference / norm)) if feature is not None else None
     matched = score is not None and score >= model.threshold
     return {'matched': matched, 'reason': ('MATCH' if matched else 'NO_MATCH') if feature is not None else reason,
-            'score': score, 'modelVersion': model.version}
+            'score': score, 'modelVersion': model.version, 'quality': quality}
