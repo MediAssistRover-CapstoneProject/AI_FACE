@@ -4,15 +4,37 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import threading
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+
+
+def native_threads():
+    """Bound native pools before importing NumPy/OpenCV, including BLAS pools."""
+    try:
+        value = int(os.getenv('FACE_NATIVE_THREADS', '1'))
+        if not 1 <= value <= 2:
+            raise ValueError()
+    except ValueError:
+        raise ValueError('FACE_NATIVE_THREADS must be 1 or 2') from None
+    return value
+
+
+NATIVE_THREADS = native_threads()
+for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+    os.environ[variable] = str(NATIVE_THREADS)
 
 import cv2
 import numpy as np
+from anyio import to_thread
 from PIL import Image, ImageOps
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import JSONResponse
+
+cv2.setNumThreads(NATIVE_THREADS)
 
 ROOT = Path(__file__).parent
 MAX_IMAGE = 2 * 1024 * 1024
@@ -21,21 +43,72 @@ PROCESSING_EDGE = 960
 QUALITY_EDGE = 160
 PIPELINE_VERSION = 'bounded-exif-960-quality160-v2'
 LOCK = threading.Lock()
-app = FastAPI(title="MAR Face verification", docs_url=None, redoc_url=None)
+INIT_LOCK = threading.Lock()
+ADMISSION = threading.BoundedSemaphore(1)
 engine = None
+initialization_error = None
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    global initialization_error
+    initialization_error = None
+    try:
+        if len(os.getenv('FACE_SERVICE_KEY', '')) < 32:
+            raise ValueError('SERVICE_KEY_NOT_CONFIGURED')
+        await to_thread.run_sync(get_engine)
+    except Exception:
+        # Keep health available for the installer; never serve verification as ready.
+        initialization_error = 'MODEL_NOT_READY'
+        logging.error('FACE_STARTUP_NOT_READY: check service configuration and pinned models')
+    yield
+
+
+app = FastAPI(title="MAR Face verification", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
 @app.middleware("http")
 async def bounded_body(request: Request, call_next):
-    if request.url.path.startswith('/v1/'):
+    if not request.url.path.startswith('/v1/'):
+        response = await call_next(request)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    try:
+        authorized(request.headers.get('X-Face-Service-Key', ''))
+    except HTTPException:
+        return JSONResponse({'detail': 'SERVICE_AUTH_REQUIRED'}, status_code=401,
+                            headers={'Cache-Control': 'no-store'})
+    if initialization_error is not None:
+        return JSONResponse({'detail': 'MODEL_NOT_READY'}, status_code=503,
+                            headers={'Cache-Control': 'no-store', 'Retry-After': '1'})
+    # Admit before reading a body: excess clients never queue images in memory.
+    if not ADMISSION.acquire(blocking=False):
+        return JSONResponse({'detail': 'FACE_BUSY'}, status_code=429,
+                            headers={'Cache-Control': 'no-store', 'Retry-After': '1'})
+    try:
         data = bytearray()
         async for chunk in request.stream():
             data.extend(chunk)
             if len(data) > 3 * 1024 * 1024:
-                from starlette.responses import JSONResponse
-                return JSONResponse({'detail': 'IMAGE_TOO_LARGE'}, status_code=413)
+                return JSONResponse({'detail': 'IMAGE_TOO_LARGE'}, status_code=413,
+                                    headers={'Cache-Control': 'no-store'})
         request._body = bytes(data)
-    return await call_next(request)
+        response = await call_next(request)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    finally:
+        ADMISSION.release()
+
+
+@contextmanager
+def inference_slot():
+    # Also guard native work if a client disconnects while its thread is finishing.
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(429, 'FACE_BUSY', headers={'Retry-After': '1'})
+    try:
+        yield
+    finally:
+        LOCK.release()
 
 
 def authorized(x_face_service_key: str = Header(default="")):
@@ -88,6 +161,11 @@ class Engine:
         if not -1 <= self.threshold <= 1:
             raise ValueError('INVALID_THRESHOLD')
 
+    def warmup(self):
+        # Synthetic pixels only. Load both native graphs before readiness succeeds.
+        self.analyze(np.zeros((480, 640, 3), dtype=np.uint8))
+        self.recognizer.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+
     def feature(self, image):
         feature, reason, _ = self.analyze(image)
         return feature, reason
@@ -100,7 +178,7 @@ class Engine:
             image = cv2.resize(image, (max(1, round(w*scale)), max(1, round(h*scale))), interpolation=cv2.INTER_AREA)
         quality = {'processingWidth': image.shape[1], 'processingHeight': image.shape[0],
                    'minFacePixels': 80, 'sharpnessThreshold': 40, 'qualityEdge': QUALITY_EDGE}
-        with LOCK:
+        with inference_slot():
             h, w = image.shape[:2]
             self.detector.setInputSize((w, h))
             _, faces = self.detector.detect(image)
@@ -134,12 +212,21 @@ class Engine:
 
 
 def get_engine():
-    global engine
+    global engine, initialization_error
+    if initialization_error is not None:
+        raise HTTPException(503, 'MODEL_NOT_READY')
     if engine is None:
-        try:
-            engine = Engine()
-        except Exception:
-            raise HTTPException(503, "MODEL_NOT_READY") from None
+        with INIT_LOCK:
+            if initialization_error is not None:
+                raise HTTPException(503, 'MODEL_NOT_READY')
+            if engine is None:
+                try:
+                    candidate = Engine()
+                    candidate.warmup()
+                    engine = candidate
+                except Exception:
+                    initialization_error = 'MODEL_NOT_READY'
+                    raise HTTPException(503, 'MODEL_NOT_READY') from None
     return engine
 
 

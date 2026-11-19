@@ -146,3 +146,105 @@ def test_real_portrait_pair_and_two_faces(client):
     blurred = cv2.GaussianBlur(first, (41, 41), 0)
     degraded = client.post('/v1/face/enroll', headers=HEADERS, json={'image': encoded(blurred)}).json()
     assert degraded['accepted'] is False
+
+
+def test_native_threads_are_bounded(monkeypatch):
+    monkeypatch.delenv('FACE_NATIVE_THREADS', raising=False)
+    assert app.native_threads() == 1
+    for invalid in ('0', '3', 'not-an-integer'):
+        monkeypatch.setenv('FACE_NATIVE_THREADS', invalid)
+        with pytest.raises(ValueError, match='FACE_NATIVE_THREADS'):
+            app.native_threads()
+
+
+def test_engine_is_initialized_and_warmed_once_under_concurrency(monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    calls = []
+    gate = threading.Barrier(8)
+
+    class Model:
+        def __init__(self):
+            calls.append('init')
+            time.sleep(.03)
+
+        def warmup(self):
+            calls.append('warmup')
+
+    monkeypatch.setattr(app, 'engine', None)
+    monkeypatch.setattr(app, 'initialization_error', None)
+    monkeypatch.setattr(app, 'Engine', Model)
+
+    def load():
+        gate.wait(timeout=3)
+        return app.get_engine()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        models = list(executor.map(lambda _: load(), range(8)))
+    assert calls == ['init', 'warmup']
+    assert all(model is models[0] for model in models)
+
+
+def test_startup_failure_stays_unready_without_reloading(monkeypatch):
+    calls = []
+
+    class Model:
+        def __init__(self):
+            calls.append('init')
+
+        def warmup(self):
+            raise RuntimeError('native graph cannot run')
+
+    monkeypatch.setenv('FACE_SERVICE_KEY', 's' * 32)
+    monkeypatch.setattr(app, 'engine', None)
+    monkeypatch.setattr(app, 'initialization_error', None)
+    monkeypatch.setattr(app, 'Engine', Model)
+    with TestClient(app.app) as client:
+        assert client.get('/health/ready').status_code == 503
+        assert client.get('/health/ready').status_code == 503
+        response = client.post('/v1/face/enroll', headers=HEADERS, json={'image': ''})
+        assert response.status_code == 503
+        assert response.headers['cache-control'] == 'no-store'
+    assert calls == ['init']
+    assert app.engine is None
+
+
+def test_busy_inference_rejects_immediately_and_recovers(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    entered, release = threading.Event(), threading.Event()
+
+    class Model:
+        version = 'a' * 64
+
+        def analyze(self, _image):
+            entered.set()
+            assert release.wait(timeout=5)
+            return None, 'NO_FACE', {}
+
+    monkeypatch.setenv('FACE_SERVICE_KEY', 's' * 32)
+    monkeypatch.setattr(app, 'engine', Model())
+    monkeypatch.setattr(app, 'initialization_error', None)
+    image = {'image': encoded(np.zeros((80, 80, 3), np.uint8))}
+    with TestClient(app.app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(client.post, '/v1/face/enroll', headers=HEADERS, json=image)
+        try:
+            assert entered.wait(timeout=3)
+            busy = client.post('/v1/face/enroll', headers=HEADERS, json=image)
+            assert busy.status_code == 429 and busy.json()['detail'] == 'FACE_BUSY'
+            assert busy.headers['retry-after'] == '1'
+            assert client.get('/health/ready').status_code == 200
+            assert client.post('/v1/face/enroll', json=image).status_code == 401
+        finally:
+            release.set()
+        assert first.result(timeout=3).status_code == 200
+        assert client.post('/v1/face/enroll', headers=HEADERS, json=image).status_code == 200
+        # Validation failures also release the admission lease.
+        assert client.post('/v1/face/enroll', headers=HEADERS, json={'image': 'bad?'}).status_code == 422
+        assert client.post('/v1/face/enroll', headers=HEADERS, json=image).status_code == 200
+    with app.LOCK:
+        with pytest.raises(app.HTTPException) as error:
+            with app.inference_slot():
+                pytest.fail('busy native inference must never be queued')
+        assert error.value.status_code == 429

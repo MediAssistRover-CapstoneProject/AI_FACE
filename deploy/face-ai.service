@@ -1,0 +1,30 @@
+[Unit]
+Description=MediAssistRover staff face verification
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=marface
+Group=marface
+WorkingDirectory=/opt/mar-face/current
+Environment=FACE_BIND_HOST=127.0.0.1
+Environment=FACE_NATIVE_THREADS=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/mediassistrover/face-ai.env
+ExecStart=/opt/mar-face/current/.venv/bin/python -B -m uvicorn app:app --host ${FACE_BIND_HOST} --port 8095 --workers 1 --limit-concurrency 8 --backlog 16 --timeout-keep-alive 3 --no-access-log
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+CPUWeight=15
+CPUQuota=50%
+MemoryHigh=384M
+MemoryMax=512M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
